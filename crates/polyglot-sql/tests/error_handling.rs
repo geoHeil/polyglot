@@ -581,3 +581,81 @@ mod generator_tests {
         assert_eq!(generated, generated2, "Roundtrip should be stable");
     }
 }
+
+// ============================================================================
+// Truncated Input Tests
+// ============================================================================
+
+mod truncated_input {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// Parse on a worker thread, so a parse that never returns fails the test instead of
+    /// hanging the suite. Returns `false` if the parse was still running after the timeout.
+    fn parse_terminates(sql: &str) -> bool {
+        let owned = sql.to_string();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Parser::parse_sql(&owned).is_ok());
+        });
+        rx.recv_timeout(Duration::from_secs(10)).is_ok()
+    }
+
+    /// Statements that exercise the parser's closer-scanning loops: parenthesised data type
+    /// arguments, function arguments, index columns, table hints, star modifiers, JSON paths,
+    /// subscripts, window specs and privilege lists.
+    const STATEMENTS: &[&str] = &[
+        "CREATE TABLE t (a VARCHAR2(2328 CHAR), b DATETIME2(2))",
+        "SELECT CAST(x AS UserDefinedType(1, 2 CHAR)) FROM t",
+        "ALTER TABLE t ADD COLUMN c NVARCHAR2(100)",
+        "SELECT a.:CustomType(1, 2) FROM t",
+        "SELECT JSON_VALUE(a, '$.b' RETURNING VARCHAR2(10)) FROM t",
+        "SELECT x::DECIMAL(10, 2) FROM t",
+        "SELECT CAST(x AS DECIMAL(10, 2)) FROM t",
+        "SELECT f(a, b, c) FROM t",
+        "SELECT * EXCEPT (a, b) FROM t",
+        "SELECT * FROM t WITH (NOLOCK, INDEX(i))",
+        "SELECT a[1], b:c FROM t",
+        "SELECT COUNT(*) OVER (PARTITION BY a ORDER BY b) FROM t",
+        "CREATE INDEX i ON t (a ASC, b DESC)",
+        "CREATE FUNCTION f(a INT, b TEXT) RETURNS INT",
+        "GRANT SELECT, INSERT ON t TO u",
+        "INSERT INTO t (a, b) VALUES (1, 2)",
+    ];
+
+    /// The six-character case that motivated this: a custom parenthesised data type reached
+    /// through `.:`, with no closing paren. `parse_data_type`'s argument loop broke only on
+    /// `RParen`, which is false at end of input, while `advance` past the end returns the last
+    /// token without moving the cursor — so the loop appended that token to the same `String`
+    /// forever.
+    #[test]
+    fn test_truncated_custom_type_args_terminate() {
+        for sql in ["a.:S1(", "CAST(x AS S1(", "CREATE TABLE t (c S1("] {
+            assert!(parse_terminates(sql), "Parsing did not terminate: {sql:?}");
+            assert!(
+                Parser::parse_sql(sql).is_err(),
+                "Expected error for truncated custom type args: {sql:?}"
+            );
+        }
+    }
+
+    /// General oracle for the whole class: every truncated prefix of a valid statement must
+    /// terminate. This does not need to know which loops exist, so it also covers the
+    /// closer-scanning loops nobody enumerated.
+    #[test]
+    fn test_every_truncated_prefix_terminates() {
+        for sql in STATEMENTS {
+            for end in 1..=sql.len() {
+                if !sql.is_char_boundary(end) {
+                    continue;
+                }
+                let prefix = &sql[..end];
+                assert!(
+                    parse_terminates(prefix),
+                    "Parsing did not terminate for prefix {prefix:?} of {sql:?}"
+                );
+            }
+        }
+    }
+}

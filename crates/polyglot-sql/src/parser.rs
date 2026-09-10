@@ -42938,9 +42938,14 @@ impl Parser {
                             name: format!("{}({})", custom_name, args),
                         })
                     } else {
+                        // Bounded like `parse_custom_type_args_balanced`: `check` is false
+                        // at end of input and `advance` past the end returns the last token
+                        // without moving the cursor, so a bare `loop` never terminates on
+                        // truncated input like `a.:S1(`. Falling out of the loop lets the
+                        // `expect` below report the missing `)`.
                         let mut args = Vec::new();
                         let mut after_comma = true; // treat first token as start of new arg
-                        loop {
+                        while !self.is_at_end() {
                             if self.check(TokenType::RParen) {
                                 break;
                             }
