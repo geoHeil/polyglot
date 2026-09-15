@@ -526,6 +526,10 @@ pub struct Parser {
     guards_checked: bool,
     /// Token statistics collected during the internal zero-copy tokenization path.
     token_guard_stats: Option<TokenGuardStats>,
+    /// Token positions where `IF` has already been tried, and rejected, as the start of
+    /// an if-expression. Without this the retry is repeated on every path that reaches
+    /// the position, and a chain of `IF`s costs 2^k.
+    if_expr_ruled_out: HashSet<usize>,
 }
 
 /// Configuration for the SQL [`Parser`].
@@ -651,6 +655,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            if_expr_ruled_out: HashSet::new(),
         }
     }
 
@@ -664,6 +669,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            if_expr_ruled_out: HashSet::new(),
         }
     }
 
@@ -680,6 +686,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: None,
+            if_expr_ruled_out: HashSet::new(),
         }
     }
 
@@ -697,6 +704,7 @@ impl Parser {
             pending_leading_comments: Vec::new(),
             guards_checked: false,
             token_guard_stats: Some(token_guard_stats),
+            if_expr_ruled_out: HashSet::new(),
         }
     }
 
@@ -34029,6 +34037,7 @@ impl Parser {
         // treat IF as a column name when not followed by ( or .
         // For TSQL/Fabric: IF (cond) BEGIN ... END is an IF statement, not function
         if self.check(TokenType::If)
+            && !self.if_expr_ruled_out.contains(&self.current)
             && !self.check_next(TokenType::Dot)
             && (!self.check_next(TokenType::LParen)
                 || matches!(
@@ -34043,8 +34052,15 @@ impl Parser {
                 return Ok(if_expr);
             }
             // parse_if() returned None — IF is not an IF expression here,
-            // restore position so it can be treated as an identifier
+            // restore position so it can be treated as an identifier.
             self.current = saved_pos;
+            // Record the rejection. Every enclosing expression parse reaches this
+            // position again and would repeat the attempt, so a chain of `IF`s parses
+            // the same suffix twice per link and cost doubles per `IF` — 75 bytes is
+            // enough to spend seconds. The outcome is a function of the token stream
+            // (it is decided by parse_disjunction failing), so a later attempt at the
+            // same position cannot decide differently.
+            self.if_expr_ruled_out.insert(saved_pos);
         }
 
         // NEXT VALUE FOR sequence_name [OVER (ORDER BY ...)]
@@ -43955,10 +43971,13 @@ impl Parser {
         let parser_tokens = tokens.into_iter().map(ParserToken::from).collect();
         let saved_tokens = std::mem::replace(&mut self.tokens, parser_tokens);
         let saved_current = std::mem::replace(&mut self.current, 0);
+        // Positions in the sub-stream are unrelated to positions in the outer one.
+        let saved_if_expr_ruled_out = std::mem::take(&mut self.if_expr_ruled_out);
         let result = self.parse_data_type();
         // Restore original parser state
         self.tokens = saved_tokens;
         self.current = saved_current;
+        self.if_expr_ruled_out = saved_if_expr_ruled_out;
         result
     }
 
@@ -45748,6 +45767,9 @@ impl Parser {
         } else if self.check(TokenType::GtGt) {
             // Split >> into two > tokens
             // Replace the GtGt with Gt and return a synthetic Gt token
+            // `if_expr_ruled_out` describes a specific token stream, and this rewrites
+            // one of its tokens, so the memo no longer applies.
+            self.if_expr_ruled_out.clear();
             let token = self.peek().clone();
             self.tokens[self.current] = Token {
                 token_type: TokenType::Gt,
@@ -66529,5 +66551,99 @@ mod termination_tests {
             Decision::Rejected,
             "an unclosed custom type argument list",
         );
+    }
+
+    /// `IF` is attempted as an if-expression and, on failure, re-read as an identifier.
+    /// Without remembering the failed attempt, a chain of them re-parses the same suffix
+    /// twice per link, so cost doubles per `IF` and 75 bytes is enough to spend half a
+    /// minute. The separator has to be a prefix-unary operator for the chain to keep
+    /// nesting as one expression, so all three are covered.
+    #[test]
+    fn test_malformed_if_chains_are_rejected_within_budget() {
+        let chains: Vec<String> = ["~", "+", "-"]
+            .iter()
+            .map(|sep| format!("IF{sep}").repeat(24) + "I?{")
+            .collect();
+        let chains: Vec<&str> = chains.iter().map(String::as_str).collect();
+        assert_all(&chains, Decision::Rejected, "a malformed 24-link IF chain");
+    }
+
+    /// The other side of the memo: it must not turn an `IF` the parser should accept into
+    /// a rejection. The last of these is the chain above with a tail that parses, which
+    /// commits instead of backtracking.
+    #[test]
+    fn test_accepted_if_forms_still_parse() {
+        let chain_that_parses = "IF~".repeat(24) + "1";
+        assert_all(
+            &[
+                "SELECT IF(a, 1, 2) FROM t",
+                "SELECT IF(a > 1, 'x', 'y') AS c FROM t",
+                "SELECT IF a THEN 1 ELSE 2 END FROM t",
+                "SELECT IF(IF(a, 1, 2), 3, 4) FROM t",
+                "SELECT IF FROM t",
+                "SELECT t.if FROM t",
+                "SELECT ~IF FROM t",
+                "SELECT +IF FROM t",
+                "SELECT -IF FROM t",
+                &chain_that_parses,
+            ],
+            Decision::Parsed,
+            "an accepted IF form",
+        );
+    }
+
+    /// The memo skips a `parse_if` attempt that has already been ruled out, and a failing
+    /// attempt touches `pending_leading_comments` on its way out — so comment placement
+    /// is where skipping it would show. Expected values are what the parser produced
+    /// before the memo existed, including the interior comments it drops, so this asserts
+    /// *unchanged*, not *ideal*.
+    #[test]
+    fn test_comments_around_a_ruled_out_if_are_unchanged() {
+        use crate::dialects::DialectType;
+
+        let cases = [
+            // `IF` re-read as an identifier, which is the position the memo remembers.
+            ("SELECT /* before */ IF FROM t", "/* before */ SELECT IF FROM t"),
+            ("SELECT IF /* after */ FROM t", "SELECT IF /* after */ FROM t"),
+            ("SELECT t.if /* dotted */ FROM t", "SELECT t.if /* dotted */ FROM t"),
+            // Chained through each prefix-unary operator: every link is a ruled-out
+            // position, and the comment between the links is dropped, as before.
+            ("SELECT IF /* mid */ ~ IF FROM t", "SELECT ~IF FROM t"),
+            ("SELECT IF ~ /* between */ IF FROM t", "SELECT ~IF FROM t"),
+            ("SELECT IF /* mid */ + IF FROM t", "SELECT IF FROM t"),
+            ("SELECT IF /* mid */ - IF FROM t", "SELECT -IF FROM t"),
+            (
+                "SELECT IF /* 1 */ ~ IF /* 2 */ ~ IF FROM t",
+                "SELECT ~ ~IF FROM t",
+            ),
+            // An `IF` that parses as an if-expression commits, so the memo is never
+            // consulted; here to keep the accepted path pinned alongside.
+            (
+                "SELECT /* c1 */ IF(a, 1, 2) FROM t",
+                "/* c1 */ SELECT CASE WHEN a THEN 1 ELSE 2 END FROM t",
+            ),
+            (
+                "SELECT IF(a, 1, 2) /* c2 */ FROM t",
+                "SELECT CASE WHEN a THEN 1 ELSE 2 END /* c2 */ FROM t",
+            ),
+            (
+                "SELECT a FROM t WHERE /* w */ IF(a, 1, 2) = 1",
+                "SELECT a FROM t WHERE CASE WHEN a THEN 1 ELSE 2 END = 1",
+            ),
+            (
+                "SELECT CASE /* c */ WHEN IF(a, 1, 2) = 1 THEN 2 ELSE IF(b, 3, 4) END FROM t",
+                "SELECT CASE WHEN CASE WHEN a THEN 1 ELSE 2 END = 1 THEN 2 ELSE CASE WHEN b THEN 3 ELSE 4 END END /* c */ FROM t",
+            ),
+        ];
+
+        for (sql, expected) in cases {
+            let out = crate::transpile(sql, DialectType::Generic, DialectType::Generic)
+                .unwrap_or_else(|e| panic!("{sql:?} should parse: {e}"));
+            assert_eq!(
+                out,
+                vec![expected.to_string()],
+                "comments moved for {sql:?}"
+            );
+        }
     }
 }
