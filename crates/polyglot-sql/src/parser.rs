@@ -66647,3 +66647,99 @@ mod termination_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod explicit_eof_token_tests {
+    //! [`Tokenizer`] never emits [`TokenType::Eof`], but `Parser::new` is public, so a
+    //! caller can hand the parser a stream that ends with one. The parser's comparisons
+    //! against the variant are what keep such a stream parsing the same as one without
+    //! it, and the cases below are the ones where removing them is observable.
+
+    use super::Parser;
+    use crate::expressions::{AlterTableAction, Expression};
+    use crate::tokens::{Span, Token, TokenType, Tokenizer};
+
+    fn parse_statement(sql: &str, terminated: bool) -> crate::error::Result<Expression> {
+        let mut tokens = Tokenizer::default().tokenize(sql).expect("tokenizing");
+        if terminated {
+            tokens.push(Token::new(TokenType::Eof, "", Span::default()));
+        }
+        Parser::new(tokens).parse_statement()
+    }
+
+    /// Appending an `Eof` token must not change the parse.
+    ///
+    /// - A trailing `BINARY` is only a column when nothing follows it, and a trailing
+    ///   `OVERLAPS` is only an alias when nothing follows it; with the `Eof` comparison
+    ///   gone, something does follow, and both become parse errors.
+    /// - `ALTER TABLE t UNSET prop` stops being an `UnsetProperty` and becomes a `Raw`
+    ///   multi-word clause.
+    /// - The two `SHOW` cases cover the parser's remaining `Eof` comparisons, where the
+    ///   variant is one alternative in a list of clause-starting tokens to stop at.
+    #[test]
+    fn test_an_explicit_eof_token_does_not_change_the_parse() {
+        for sql in [
+            "SELECT BINARY",
+            "SELECT a OVERLAPS",
+            "ALTER TABLE t UNSET prop",
+            "ALTER TABLE t UNSET TAG x",
+            "SHOW TABLES",
+            "SHOW PRIMARY KEYS",
+            "SHOW TERSE DATABASES",
+            "SHOW GRANTS FOR foo",
+            "SHOW PROFILE FOR QUERY 5",
+            "SHOW GROUPS FOR ROLE",
+        ] {
+            let unterminated = parse_statement(sql, false);
+            let terminated = parse_statement(sql, true);
+            assert!(
+                unterminated.is_ok(),
+                "{sql:?} should parse without a terminator: {:?}",
+                unterminated.err()
+            );
+            assert_eq!(
+                format!("{terminated:?}"),
+                format!("{unterminated:?}"),
+                "a trailing Eof token changed the parse of {sql:?}"
+            );
+        }
+    }
+
+    /// One place where a trailing `Eof` token is *not* transparent, pinned so that the
+    /// gap is visible rather than surprising: the scan that collects a multi-word
+    /// `UNSET` clause stops at end of input and at `;`, but has no `Eof` comparison, so
+    /// it takes the token as another word and leaves a trailing space in the raw SQL.
+    /// This is unchanged from before this branch — verified against `origin/main` — and
+    /// fixing it would mean adding a comparison rather than keeping one, so it is left
+    /// alone here.
+    #[test]
+    fn test_a_raw_unset_clause_absorbs_an_explicit_eof() {
+        let raw =
+            |terminated| match parse_statement("ALTER TABLE t UNSET PROJECTION POLICY", terminated)
+            {
+                Ok(Expression::AlterTable(alter)) => match alter.actions.as_slice() {
+                    [AlterTableAction::Raw { sql }] => sql.clone(),
+                    other => panic!("expected one Raw action, got {other:?}"),
+                },
+                other => panic!("expected an ALTER TABLE, got {other:?}"),
+            };
+        assert_eq!(raw(false), "UNSET PROJECTION POLICY");
+        assert_eq!(raw(true), "UNSET PROJECTION POLICY ");
+    }
+
+    /// The `UNSET` property case names its outcome, because there both parses succeed
+    /// and only the action they produce differs.
+    #[test]
+    fn test_unset_property_with_an_explicit_eof_is_not_a_raw_clause() {
+        let parsed = parse_statement("ALTER TABLE t UNSET prop", true).expect("should parse");
+        let Expression::AlterTable(alter) = parsed else {
+            panic!("expected an ALTER TABLE, got {parsed:?}");
+        };
+        assert_eq!(
+            alter.actions,
+            vec![AlterTableAction::UnsetProperty {
+                properties: vec!["prop".to_string()],
+            }]
+        );
+    }
+}
