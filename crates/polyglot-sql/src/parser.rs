@@ -32825,6 +32825,12 @@ impl Parser {
 
     #[inline(never)]
     fn parse_primary_inner(&mut self) -> Result<Expression> {
+        // Public fragment parsers can reach this path without the statement-level
+        // empty-input checks, including after a leading EOF has been normalized away.
+        if self.tokens.is_empty() {
+            return Err(self.end_of_input_error());
+        }
+
         // Exasol-style IF expression: IF condition THEN true_value ELSE false_value ENDIF
         // Check for IF not followed by ( (which would be IF function call handled elsewhere)
         // This handles: IF age < 18 THEN 'minor' ELSE 'adult' ENDIF
@@ -67204,6 +67210,110 @@ mod explicit_eof_token_tests {
             tokens.push(Token::new(TokenType::Eof, "", Span::default()));
         }
         Parser::new(tokens).parse_statement()
+    }
+
+    type FragmentParser = fn(&mut Parser) -> crate::error::Result<Option<Expression>>;
+
+    const FRAGMENT_PARSERS: &[(&str, FragmentParser, &str)] = &[
+        ("disjunction", Parser::parse_disjunction, "a OR b"),
+        ("conjunction", Parser::parse_conjunction, "a AND b"),
+        (
+            "select_or_expression",
+            Parser::parse_select_or_expression,
+            "SELECT 1",
+        ),
+        ("value", Parser::parse_value, "(1, 2)"),
+        (
+            "set_item_assignment",
+            Parser::parse_set_item_assignment,
+            "x = 1",
+        ),
+    ];
+
+    fn parser_constructors(tokens: &[Token], source: &str) -> [(&'static str, Parser); 3] {
+        [
+            ("new", Parser::new(tokens.to_vec())),
+            (
+                "with_config",
+                Parser::with_config(tokens.to_vec(), ParserConfig::default()),
+            ),
+            (
+                "with_source",
+                Parser::with_source(tokens.to_vec(), ParserConfig::default(), source.to_owned()),
+            ),
+        ]
+    }
+
+    /// Public expression-fragment helpers do not dispatch through `parse_statement`.
+    /// They must safely report no expression when normalization leaves an empty stream.
+    #[test]
+    fn test_expression_fragment_parsers_handle_empty_normalized_streams() {
+        let eof = || Token::new(TokenType::Eof, "", Span::default());
+        let mut leading = vec![eof()];
+        leading.extend(Tokenizer::default().tokenize("SELECT 1").unwrap());
+        for (shape, tokens, malformed) in [
+            ("EOF only", vec![eof()], false),
+            ("empty", Vec::new(), false),
+            ("leading EOF", leading, true),
+            ("duplicate EOF", vec![eof(), eof()], true),
+        ] {
+            for (name, parse_fragment, _) in FRAGMENT_PARSERS {
+                for (constructor, mut parser) in parser_constructors(&tokens, "SELECT 1") {
+                    for _ in 0..2 {
+                        assert!(
+                            parse_fragment(&mut parser)
+                                .expect("an empty fragment is not an error")
+                                .is_none(),
+                            "{name}, {constructor}, {shape}"
+                        );
+                    }
+
+                    // Trying a fragment must not clear the placement error that the
+                    // top-level entry points are responsible for reporting.
+                    if malformed {
+                        for error in [
+                            parser
+                                .parse()
+                                .expect_err("parse must reject tokens after EOF"),
+                            parser
+                                .parse_statement()
+                                .expect_err("parse_statement must reject tokens after EOF"),
+                            parser
+                                .parse_standalone_data_type()
+                                .expect_err("type parsing must reject tokens after EOF"),
+                        ] {
+                            assert!(
+                                error
+                                    .to_string()
+                                    .contains("Unexpected token after end of input"),
+                                "{name}, {constructor}, {shape}: {error}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_expression_fragment_parsers_preserve_nonempty_input_with_eof() {
+        for (name, parse_fragment, sql) in FRAGMENT_PARSERS {
+            let tokens = Tokenizer::default().tokenize(sql).unwrap();
+            let mut terminated = tokens.clone();
+            terminated.push(Token::new(TokenType::Eof, "", Span::default()));
+            for ((constructor, mut plain), (_, mut terminated)) in parser_constructors(&tokens, sql)
+                .into_iter()
+                .zip(parser_constructors(&terminated, sql))
+            {
+                let expected = parse_fragment(&mut plain).expect("valid fragment should parse");
+                assert!(expected.is_some(), "{name}, {constructor}: {sql}");
+                assert_eq!(
+                    parse_fragment(&mut terminated).expect("EOF must not change a valid fragment"),
+                    expected,
+                    "{name}, {constructor}: {sql}"
+                );
+            }
+        }
     }
 
     /// Appending an `Eof` token must not change the parse.
