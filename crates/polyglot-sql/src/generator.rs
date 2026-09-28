@@ -5732,7 +5732,7 @@ impl Generator {
             Some(DialectType::Presto) | Some(DialectType::Trino)
         );
 
-        if is_presto_like && select.offset.is_some() {
+        if is_presto_like && select.offset.is_some() && !self.uses_fetch_first_limit() {
             // Presto/Trino syntax: OFFSET n LIMIT m (offset comes first)
             if let Some(offset) = &select.offset {
                 if self.config.pretty {
@@ -7714,7 +7714,7 @@ impl Generator {
         }
 
         // Generate the base (leftmost) expression
-        self.generate_expression(leftmost)?;
+        self.generate_set_operand(leftmost)?;
 
         // Generate each union step from innermost to outermost
         for union in chain.iter().rev() {
@@ -7776,7 +7776,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_expression(&union.right)?;
+        self.generate_set_operand(&union.right)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &union.order_by {
             if self.config.pretty {
@@ -7878,7 +7878,7 @@ impl Generator {
             self.write_space();
         }
 
-        self.generate_expression(leftmost)?;
+        self.generate_set_operand(leftmost)?;
 
         for intersect in chain.iter().rev() {
             self.generate_intersect_step(intersect)?;
@@ -7942,7 +7942,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_expression(&intersect.right)?;
+        self.generate_set_operand(&intersect.right)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &intersect.order_by {
             if self.config.pretty {
@@ -8043,7 +8043,7 @@ impl Generator {
             self.write_space();
         }
 
-        self.generate_expression(leftmost)?;
+        self.generate_set_operand(leftmost)?;
 
         for except in chain.iter().rev() {
             self.generate_except_step(except)?;
@@ -8141,7 +8141,7 @@ impl Generator {
         } else {
             self.write_space();
         }
-        self.generate_expression(&except.right)?;
+        self.generate_set_operand(&except.right)?;
         // ORDER BY, LIMIT, OFFSET for the set operation
         if let Some(order_by) = &except.order_by {
             if self.config.pretty {
@@ -29876,8 +29876,53 @@ impl Generator {
 
     /// Whether a plain `LIMIT n` must be rendered as the ANSI row-limiting clause
     /// `[OFFSET m ROWS] FETCH FIRST n ROWS ONLY` (Oracle, DB2, ...).
+    ///
+    /// The configured style takes precedence over dialect-specific LIMIT/OFFSET
+    /// handling, except for T-SQL/Fabric: their TOP / `OFFSET ... FETCH NEXT`
+    /// rendering is already a row-limiting clause, and FETCH requires ORDER BY there.
     fn uses_fetch_first_limit(&self) -> bool {
         self.config.limit_fetch_style == LimitFetchStyle::FetchFirst
+            && !matches!(
+                self.config.dialect,
+                Some(DialectType::TSQL) | Some(DialectType::Fabric)
+            )
+    }
+
+    /// Generate a UNION / INTERSECT / EXCEPT operand. A bare SELECT whose row
+    /// limit renders as a trailing clause (e.g. T-SQL `TOP n` as `LIMIT n` or
+    /// `FETCH FIRST n ROWS ONLY`) is parenthesized, so the limit stays on that
+    /// branch instead of binding to the whole set operation. ClickHouse already
+    /// binds branch LIMITs locally.
+    fn generate_set_operand(&mut self, expr: &Expression) -> Result<()> {
+        let Expression::Select(select) = expr else {
+            return self.generate_expression(expr);
+        };
+        if self.config.dialect == Some(DialectType::ClickHouse) {
+            return self.generate_expression(expr);
+        }
+        let tsql_like = matches!(
+            self.config.dialect,
+            Some(DialectType::TSQL) | Some(DialectType::Fabric)
+        );
+        let is_top_dialect = tsql_like || self.config.dialect == Some(DialectType::Teradata);
+        let trailing_top = select.top.as_ref().is_some_and(|top| {
+            !is_top_dialect && (self.uses_fetch_first_limit() || !(top.percent || top.with_ties))
+        });
+        let trailing_limit = select.offset.is_some()
+            || (select.limit.is_some() && !tsql_like)
+            || (select.limit.is_none() && trailing_top);
+        if !trailing_limit {
+            return self.generate_expression(expr);
+        }
+        if self.config.dialect == Some(DialectType::SQLite) {
+            // SQLite does not accept parenthesized compound-select operands.
+            self.write_keyword("SELECT * FROM");
+            self.write_space();
+        }
+        self.write("(");
+        self.generate_expression(expr)?;
+        self.write(")");
+        Ok(())
     }
 
     /// Write `FETCH FIRST <count> [PERCENT] ROWS {ONLY | WITH TIES}`.
@@ -35990,6 +36035,10 @@ impl Generator {
 
     fn generate_limit(&mut self, e: &Limit) -> Result<()> {
         if self.uses_fetch_first_limit() {
+            // LIMIT ALL / LIMIT NULL mean "no limit": there is no FETCH equivalent.
+            if Self::is_noop_limit_expr(&e.this) {
+                return Ok(());
+            }
             self.write_fetch_first(&e.this, e.percent, false)?;
         } else {
             self.write_keyword("LIMIT");
@@ -44899,6 +44948,104 @@ mod tests {
 
     fn test_column(name: &str) -> Expression {
         crate::builder::col(name).into_inner()
+    }
+
+    fn fetch_first_sql(expr: &Expression, dialect: Option<DialectType>, pretty: bool) -> String {
+        let config = GeneratorConfig {
+            limit_fetch_style: LimitFetchStyle::FetchFirst,
+            dialect,
+            pretty,
+            ..Default::default()
+        };
+        Generator::with_config(config).generate(expr).unwrap()
+    }
+
+    fn parse_one(sql: &str) -> Expression {
+        Parser::parse_sql(sql).unwrap().remove(0)
+    }
+
+    #[test]
+    fn test_fetch_first_style_renders_builder_limits() {
+        let limit = crate::builder::from("t")
+            .select_cols(["a"])
+            .limit(5)
+            .build();
+        assert_eq!(
+            fetch_first_sql(&limit, None, false),
+            "SELECT a FROM t FETCH FIRST 5 ROWS ONLY"
+        );
+        let limit_offset = crate::builder::from("t")
+            .select_cols(["a"])
+            .limit(5)
+            .offset(10)
+            .build();
+        assert_eq!(
+            fetch_first_sql(&limit_offset, Some(DialectType::Oracle), false),
+            "SELECT a FROM t OFFSET 10 ROWS FETCH FIRST 5 ROWS ONLY"
+        );
+        assert_eq!(
+            fetch_first_sql(&limit_offset, Some(DialectType::Oracle), true),
+            "SELECT\n  a\nFROM t\nOFFSET 10 ROWS\nFETCH FIRST 5 ROWS ONLY"
+        );
+    }
+
+    #[test]
+    fn test_fetch_first_style_drops_noop_limits() {
+        for sql in ["SELECT a FROM t LIMIT ALL", "SELECT a FROM t LIMIT NULL"] {
+            assert_eq!(
+                fetch_first_sql(&parse_one(sql), None, false),
+                "SELECT a FROM t"
+            );
+        }
+        for this in [
+            Expression::Null(Null),
+            Expression::Var(Box::new(Var { this: "ALL".into() })),
+        ] {
+            let limit = Expression::Limit(Box::new(Limit {
+                this,
+                percent: false,
+                comments: Vec::new(),
+            }));
+            assert_eq!(fetch_first_sql(&limit, None, false), "");
+        }
+    }
+
+    #[test]
+    fn test_fetch_first_style_precedence_over_dialect_limit_handling() {
+        let sql = "SELECT a FROM t ORDER BY a LIMIT 5 OFFSET 2";
+        // T-SQL/Fabric keep their own TOP / OFFSET ... FETCH NEXT rendering.
+        for dialect in [DialectType::TSQL, DialectType::Fabric] {
+            assert_eq!(
+                fetch_first_sql(&parse_one(sql), Some(dialect), false),
+                "SELECT a FROM t ORDER BY a OFFSET 2 ROWS FETCH NEXT 5 ROWS ONLY",
+                "{dialect:?}"
+            );
+            assert_eq!(
+                fetch_first_sql(&parse_one("SELECT a FROM t LIMIT 5"), Some(dialect), false),
+                "SELECT TOP 5 a FROM t",
+                "{dialect:?}"
+            );
+        }
+        // Everywhere else the configured style wins, with or without OFFSET.
+        for dialect in [
+            DialectType::Presto,
+            DialectType::Trino,
+            DialectType::PostgreSQL,
+        ] {
+            assert_eq!(
+                fetch_first_sql(&parse_one(sql), Some(dialect), false),
+                "SELECT a FROM t ORDER BY a OFFSET 2 ROWS FETCH FIRST 5 ROWS ONLY",
+                "{dialect:?}"
+            );
+        }
+        // An explicit FETCH is kept verbatim.
+        let fetch = "SELECT a FROM t ORDER BY a OFFSET 2 ROWS FETCH FIRST 5 ROWS ONLY";
+        for dialect in [DialectType::TSQL, DialectType::Trino, DialectType::Oracle] {
+            assert_eq!(
+                fetch_first_sql(&parse_one(fetch), Some(dialect), false),
+                fetch
+            );
+        }
     }
 
     #[test]
