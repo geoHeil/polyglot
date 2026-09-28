@@ -5174,6 +5174,7 @@ impl Generator {
             Some(DialectType::TSQL) | Some(DialectType::Teradata) | Some(DialectType::Fabric)
         );
         let keep_top_verbatim = !is_top_dialect
+            && !self.uses_fetch_first_limit()
             && select.limit.is_none()
             && select
                 .top
@@ -5791,8 +5792,12 @@ impl Generator {
                     )
             });
 
+            // FETCH FIRST dialects (Oracle) render LIMIT/TOP as a row-limiting clause
+            // after OFFSET. An explicit FETCH on the same SELECT keeps the LIMIT as-is.
+            let limit_as_fetch = self.uses_fetch_first_limit() && select.fetch.is_none();
+
             // Standard LIMIT clause (skip for SQL Server - we use TOP or OFFSET/FETCH instead)
-            if let Some(limit) = &select.limit {
+            if let Some(limit) = select.limit.as_ref().filter(|_| !limit_as_fetch) {
                 // SQL Server uses TOP (no OFFSET) or OFFSET/FETCH (with OFFSET) instead of LIMIT
                 if !matches!(
                     self.config.dialect,
@@ -5826,7 +5831,8 @@ impl Generator {
             }
 
             // Convert TOP to LIMIT for non-TOP dialects
-            if select.top.is_some() && !is_top_dialect && select.limit.is_none() {
+            if select.top.is_some() && !is_top_dialect && select.limit.is_none() && !limit_as_fetch
+            {
                 if let Some(top) = &select.top {
                     if !top.percent && !top.with_ties {
                         if self.config.pretty {
@@ -5895,10 +5901,37 @@ impl Generator {
                     self.write_keyword("OFFSET");
                     self.write_space();
                     self.write_limit_expr(&offset.this)?;
-                    // Output ROWS keyword if it was in the original SQL
-                    if offset.rows == Some(true) {
+                    // Output ROWS keyword if it was in the original SQL; the
+                    // ANSI row-limiting clause requires it.
+                    if offset.rows == Some(true) || self.uses_fetch_first_limit() {
                         self.write_space();
                         self.write_keyword("ROWS");
+                    }
+                }
+            }
+
+            if limit_as_fetch {
+                // LIMIT ALL / LIMIT NULL mean "no limit": emit nothing.
+                let fetch = match (&select.limit, &select.top) {
+                    (Some(limit), _) if !Self::is_noop_limit_expr(&limit.this) => {
+                        Some((&limit.this, limit.percent, false, limit.comments.as_slice()))
+                    }
+                    (None, Some(top)) if !is_top_dialect => {
+                        Some((&top.this, top.percent, top.with_ties, &[][..]))
+                    }
+                    _ => None,
+                };
+                if let Some((count, percent, with_ties, comments)) = fetch {
+                    if self.config.pretty {
+                        self.write_newline();
+                        self.write_indent();
+                    } else {
+                        self.write_space();
+                    }
+                    self.write_fetch_first(count, percent, with_ties)?;
+                    for comment in comments {
+                        self.write(" ");
+                        self.write_formatted_comment(comment);
                     }
                 }
             }
@@ -7760,26 +7793,7 @@ impl Generator {
                 self.generate_ordered(ordered)?;
             }
         }
-        if let Some(limit) = &union.limit {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("LIMIT");
-            self.write_space();
-            self.generate_expression(limit)?;
-        }
-        if let Some(offset) = &union.offset {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("OFFSET");
-            self.write_space();
-            self.generate_expression(offset)?;
-        }
+        self.generate_set_op_limit_offset(union.limit.as_deref(), union.offset.as_deref())?;
         // DISTRIBUTE BY (Hive/Spark)
         if let Some(distribute_by) = &union.distribute_by {
             self.write_space();
@@ -7945,26 +7959,7 @@ impl Generator {
                 self.generate_ordered(ordered)?;
             }
         }
-        if let Some(limit) = &intersect.limit {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("LIMIT");
-            self.write_space();
-            self.generate_expression(limit)?;
-        }
-        if let Some(offset) = &intersect.offset {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("OFFSET");
-            self.write_space();
-            self.generate_expression(offset)?;
-        }
+        self.generate_set_op_limit_offset(intersect.limit.as_deref(), intersect.offset.as_deref())?;
         // DISTRIBUTE BY (Hive/Spark)
         if let Some(distribute_by) = &intersect.distribute_by {
             self.write_space();
@@ -8163,26 +8158,7 @@ impl Generator {
                 self.generate_ordered(ordered)?;
             }
         }
-        if let Some(limit) = &except.limit {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("LIMIT");
-            self.write_space();
-            self.generate_expression(limit)?;
-        }
-        if let Some(offset) = &except.offset {
-            if self.config.pretty {
-                self.write_newline();
-            } else {
-                self.write_space();
-            }
-            self.write_keyword("OFFSET");
-            self.write_space();
-            self.generate_expression(offset)?;
-        }
+        self.generate_set_op_limit_offset(except.limit.as_deref(), except.offset.as_deref())?;
         // DISTRIBUTE BY (Hive/Spark)
         if let Some(distribute_by) = &except.distribute_by {
             self.write_space();
@@ -26673,23 +26649,7 @@ impl Generator {
                 }
             }
 
-            if let Some(limit) = &subquery.limit {
-                self.write_space();
-                self.write_keyword("LIMIT");
-                self.write_space();
-                self.generate_expression(&limit.this)?;
-                if limit.percent {
-                    self.write_space();
-                    self.write_keyword("PERCENT");
-                }
-            }
-
-            if let Some(offset) = &subquery.offset {
-                self.write_space();
-                self.write_keyword("OFFSET");
-                self.write_space();
-                self.generate_expression(&offset.this)?;
-            }
+            self.generate_subquery_limit_offset(subquery)?;
         }
 
         if !skip_outer_parens {
@@ -26715,23 +26675,7 @@ impl Generator {
                 }
             }
 
-            if let Some(limit) = &subquery.limit {
-                self.write_space();
-                self.write_keyword("LIMIT");
-                self.write_space();
-                self.generate_expression(&limit.this)?;
-                if limit.percent {
-                    self.write_space();
-                    self.write_keyword("PERCENT");
-                }
-            }
-
-            if let Some(offset) = &subquery.offset {
-                self.write_space();
-                self.write_keyword("OFFSET");
-                self.write_space();
-                self.generate_expression(&offset.this)?;
-            }
+            self.generate_subquery_limit_offset(subquery)?;
 
             // Generate DISTRIBUTE BY (Hive/Spark)
             if let Some(distribute_by) = &subquery.distribute_by {
@@ -29928,6 +29872,35 @@ impl Generator {
             }
         }
         self.generate_expression(expr)
+    }
+
+    /// Whether a plain `LIMIT n` must be rendered as the ANSI row-limiting clause
+    /// `[OFFSET m ROWS] FETCH FIRST n ROWS ONLY` (Oracle, DB2, ...).
+    fn uses_fetch_first_limit(&self) -> bool {
+        self.config.limit_fetch_style == LimitFetchStyle::FetchFirst
+    }
+
+    /// Write `FETCH FIRST <count> [PERCENT] ROWS {ONLY | WITH TIES}`.
+    fn write_fetch_first(
+        &mut self,
+        count: &Expression,
+        percent: bool,
+        with_ties: bool,
+    ) -> Result<()> {
+        self.write_keyword("FETCH FIRST");
+        self.write_space();
+        self.write_limit_expr(count)?;
+        if percent {
+            self.write_space();
+            self.write_keyword("PERCENT");
+        }
+        self.write_space();
+        self.write_keyword(if with_ties {
+            "ROWS WITH TIES"
+        } else {
+            "ROWS ONLY"
+        });
+        Ok(())
     }
 
     fn is_noop_limit_expr(expr: &Expression) -> bool {
@@ -35935,13 +35908,97 @@ impl Generator {
         Ok(())
     }
 
-    fn generate_limit(&mut self, e: &Limit) -> Result<()> {
-        self.write_keyword("LIMIT");
-        self.write_space();
-        self.write_limit_expr(&e.this)?;
-        if e.percent {
+    /// Trailing `LIMIT n OFFSET m` of a UNION / INTERSECT / EXCEPT, or
+    /// `OFFSET m ROWS FETCH FIRST n ROWS ONLY` for FETCH FIRST dialects.
+    fn generate_set_op_limit_offset(
+        &mut self,
+        limit: Option<&Expression>,
+        offset: Option<&Expression>,
+    ) -> Result<()> {
+        let fetch_first = self.uses_fetch_first_limit();
+        if let Some(limit) = limit.filter(|_| !fetch_first) {
+            if self.config.pretty {
+                self.write_newline();
+            } else {
+                self.write_space();
+            }
+            self.write_keyword("LIMIT");
             self.write_space();
-            self.write_keyword("PERCENT");
+            self.generate_expression(limit)?;
+        }
+        if let Some(offset) = offset {
+            if self.config.pretty {
+                self.write_newline();
+            } else {
+                self.write_space();
+            }
+            self.write_keyword("OFFSET");
+            self.write_space();
+            self.generate_expression(offset)?;
+            if fetch_first {
+                self.write_space();
+                self.write_keyword("ROWS");
+            }
+        }
+        if let Some(limit) = limit.filter(|l| fetch_first && !Self::is_noop_limit_expr(l)) {
+            if self.config.pretty {
+                self.write_newline();
+            } else {
+                self.write_space();
+            }
+            self.write_fetch_first(limit, false, false)?;
+        }
+        Ok(())
+    }
+
+    /// `LIMIT` / `OFFSET` modifiers attached to a subquery, or
+    /// `OFFSET m ROWS FETCH FIRST n ROWS ONLY` for FETCH FIRST dialects.
+    fn generate_subquery_limit_offset(&mut self, subquery: &Subquery) -> Result<()> {
+        let fetch_first = self.uses_fetch_first_limit();
+        if let Some(limit) = subquery.limit.as_ref().filter(|_| !fetch_first) {
+            self.write_space();
+            self.write_keyword("LIMIT");
+            self.write_space();
+            self.generate_expression(&limit.this)?;
+            if limit.percent {
+                self.write_space();
+                self.write_keyword("PERCENT");
+            }
+        }
+
+        if let Some(offset) = &subquery.offset {
+            self.write_space();
+            self.write_keyword("OFFSET");
+            self.write_space();
+            self.generate_expression(&offset.this)?;
+            if fetch_first {
+                self.write_space();
+                self.write_keyword("ROWS");
+            }
+        }
+
+        if let Some(limit) = subquery
+            .limit
+            .as_ref()
+            .filter(|l| fetch_first && !Self::is_noop_limit_expr(&l.this))
+        {
+            self.write_space();
+            self.write_fetch_first(&limit.this, limit.percent, false)?;
+        }
+        Ok(())
+    }
+
+    fn generate_limit(&mut self, e: &Limit) -> Result<()> {
+        if self.uses_fetch_first_limit() {
+            self.write_fetch_first(&e.this, e.percent, false)?;
+        } else {
+            self.write_keyword("LIMIT");
+            self.write_space();
+            self.write_limit_expr(&e.this)?;
+            if e.percent {
+                self.write_space();
+                self.write_keyword("PERCENT");
+            }
         }
         // Emit any comments that were captured from before the LIMIT keyword
         for comment in &e.comments {
