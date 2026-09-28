@@ -29894,6 +29894,15 @@ impl Generator {
     /// branch instead of binding to the whole set operation. ClickHouse already
     /// binds branch LIMITs locally.
     fn generate_set_operand(&mut self, expr: &Expression) -> Result<()> {
+        // Group the annotated operand itself, keeping its comments outside the parentheses.
+        if let Expression::Annotated(annotated) = expr {
+            self.generate_set_operand(&annotated.this)?;
+            for comment in &annotated.trailing_comments {
+                self.write(" ");
+                self.write_formatted_comment(comment);
+            }
+            return Ok(());
+        }
         let Expression::Select(select) = expr else {
             return self.generate_expression(expr);
         };
@@ -45007,6 +45016,46 @@ mod tests {
                 comments: Vec::new(),
             }));
             assert_eq!(fetch_first_sql(&limit, None, false), "");
+        }
+    }
+
+    /// Comment-annotated set operands are grouped like bare ones, with the comment
+    /// rendered outside the parentheses.
+    #[test]
+    fn test_annotated_set_operand_limit_stays_branch_local() {
+        let annotate = |sql: &str| {
+            Expression::Annotated(Box::new(Annotated {
+                this: parse_one(sql),
+                trailing_comments: vec![" branch note ".into()],
+            }))
+        };
+        let limited = || annotate("SELECT a FROM t LIMIT 5");
+        let plain = || parse_one("SELECT a FROM u");
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for limited_left in [true, false] {
+                let mut expr = parse_one(&format!("SELECT a FROM t {op} SELECT a FROM u"));
+                let (left, right) = match &mut expr {
+                    Expression::Union(u) => (&mut u.left, &mut u.right),
+                    Expression::Intersect(i) => (&mut i.left, &mut i.right),
+                    Expression::Except(e) => (&mut e.left, &mut e.right),
+                    other => panic!("unexpected {other:?}"),
+                };
+                let expected = if limited_left {
+                    (*left, *right) = (limited(), plain());
+                    format!("(SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u")
+                } else {
+                    (*left, *right) = (plain(), limited());
+                    format!("SELECT a FROM u {op} (SELECT a FROM t LIMIT 5) /* branch note */")
+                };
+                let config = GeneratorConfig {
+                    dialect: Some(DialectType::DuckDB),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    Generator::with_config(config).generate(&expr).unwrap(),
+                    expected
+                );
+            }
         }
     }
 

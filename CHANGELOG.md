@@ -24,7 +24,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
   (e.g. T-SQL `SELECT TOP 5 ...` in a `UNION` branch transpiled to `LIMIT` or
   `FETCH FIRST`) is now parenthesized, so it no longer limits the whole set
   operation. SQLite, which rejects parenthesized operands, gets
-  `SELECT * FROM (...)` instead.
+  `SELECT * FROM (...)` instead. Operands wrapped in comments (e.g. a comment
+  before `UNION ALL`) are grouped the same way, with the comment kept outside
+  the parentheses.
 
 ## [0.13.0] - 2026-09-24
 

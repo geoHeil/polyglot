@@ -5890,6 +5890,36 @@ mod oracle_row_limit_regressions {
         );
     }
 
+    /// A comment between an operand and the set operator wraps the operand in
+    /// `Annotated`; its branch limit must still be grouped, with the comment kept
+    /// outside the parentheses.
+    #[test]
+    fn commented_tsql_top_set_operand_stays_branch_local() {
+        for op in ["UNION ALL", "INTERSECT", "EXCEPT"] {
+            for comment in ["/* branch note */", "-- branch note"] {
+                let sql = format!("SELECT TOP 5 a FROM t\n{comment}\n{op} SELECT a FROM u");
+                assert_eq!(
+                    transpile(&sql, TSQL, DuckDB),
+                    format!("(SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, SQLite),
+                    format!("SELECT * FROM (SELECT a FROM t LIMIT 5) /* branch note */ {op} SELECT a FROM u"),
+                    "{sql}"
+                );
+                assert_eq!(
+                    transpile(&sql, TSQL, Oracle),
+                    format!(
+                        "(SELECT a FROM t FETCH FIRST 5 ROWS ONLY) /* branch note */ {} SELECT a FROM u",
+                        if op == "EXCEPT" { "MINUS" } else { op }
+                    ),
+                    "{sql}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn oracle_fetch_identity_is_preserved() {
         for sql in [
